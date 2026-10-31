@@ -9,6 +9,7 @@ from scipy.sparse import csr_array
 import scipy.sparse.csgraph as csgraph_subpackage
 from scipy.sparse.csgraph import (
     connected_components,
+    bridges,
     laplacian,
     shortest_path,
     floyd_warshall,
@@ -44,6 +45,7 @@ def A():
 check_these_functions = [
     # (csgraph_function, args),
     (connected_components, ()),
+    (bridges, ()),
     (laplacian, ()),
     (floyd_warshall, ()),
     (dijkstra, ()),

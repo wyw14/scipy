@@ -8,6 +8,7 @@ Routines for traversing graphs in compressed sparse format
 import numpy as np
 cimport numpy as np
 
+from scipy.sparse import csr_array, triu
 from scipy.sparse.csgraph._validation import validate_graph
 from scipy.sparse.csgraph._tools import reconstruct_path
 
@@ -942,3 +943,216 @@ cdef int _connected_components_undirected2(
             label += 1
 
     return label
+
+
+def bridges(csgraph):
+    r"""
+    bridges(csgraph)
+
+    Find the bridges of an undirected graph.
+
+    A bridge (or cut edge) is an edge whose removal increases the number
+    of connected components of the graph.
+
+    .. versionadded:: 2.0.0
+
+    Parameters
+    ----------
+    csgraph : array_like or sparse array or matrix
+        The N x N matrix representing an undirected graph.  An edge is
+        considered to connect nodes i and j whenever at least one of
+        ``csgraph[i, j]`` or ``csgraph[j, i]`` is non-null; storing both
+        directions still represents a single edge.  Diagonal entries
+        (self-loops) are ignored.  The input csgraph will be converted to
+        csr format for the calculation and is not modified.
+
+    Returns
+    -------
+    bridges : ndarray of shape (n_bridges, 2)
+        Each row holds the two node indices of a bridge, ordered with the
+        smaller index first.  Rows are sorted in lexicographic order.
+        If the graph has no bridges, an empty array of shape ``(0, 2)``
+        is returned.
+
+    Notes
+    -----
+    Bridges are found with an iterative depth-first search [1]_.  For a
+    graph with V nodes and E edges, both the running time and the extra
+    storage are O(V + E).  The search is iterative rather than
+    recursive, so graphs containing very long paths do not exhaust the
+    recursion limit.
+
+    References
+    ----------
+    .. [1] Robert Tarjan, "A note on finding the bridges of a graph",
+           Information Processing Letters, 2(6), 1974,
+           :doi:`10.1016/0020-0190(74)90003-9`
+
+    Examples
+    --------
+    >>> import numpy as np
+    >>> from scipy.sparse import csr_array
+    >>> from scipy.sparse.csgraph import bridges
+
+    Every edge of a path is a bridge:
+
+    >>> path = csr_array([[0, 1, 0, 0],
+    ...                   [1, 0, 1, 0],
+    ...                   [0, 1, 0, 1],
+    ...                   [0, 0, 1, 0]])
+    >>> bridges(path)
+    array([[0, 1],
+           [1, 2],
+           [2, 3]], dtype=int32)
+
+    A cycle has no bridges:
+
+    >>> cycle = csr_array([[0, 1, 1],
+    ...                    [1, 0, 1],
+    ...                    [1, 1, 0]])
+    >>> bridges(cycle)
+    array([], shape=(0, 2), dtype=int32)
+    """
+    csgraph = validate_graph(csgraph, False, dense_output=False)
+    cdef int N = csgraph.shape[0]
+
+    # Build the pattern of the undirected graph from stored *coordinates*
+    # only: every stored off-diagonal entry csgraph[i, j] is an edge, no
+    # matter what its (possibly zero) value is.  Orienting each stored
+    # entry both ways and taking the strict upper triangle leaves exactly
+    # one entry per unordered pair i < j; entries stored in both
+    # directions collapse into one during CSR construction.  Coordinates
+    # are used directly rather than adding the transpose, because sparse
+    # addition discards entries whose summed value happens to be zero.
+    graph_coo = csgraph.tocoo(copy=False)
+    off_diagonal = graph_coo.row != graph_coo.col
+    arc_row = graph_coo.row[off_diagonal]
+    arc_col = graph_coo.col[off_diagonal]
+
+    sym = csr_array(
+        (np.ones(2 * arc_row.shape[0], dtype=np.int64),
+         (np.concatenate((arc_row, arc_col)),
+          np.concatenate((arc_col, arc_row)))),
+        shape=(N, N))
+    upper = triu(sym, k=1, format='csr')
+
+    # Assign one edge id per unordered pair, in lexicographic (row-major)
+    # order.  Build a symmetric adjacency CSR whose *values* are the edge
+    # ids: entry k of the upper triangle appears once in each direction.
+    cdef Py_ssize_t n_edges = upper.nnz
+    rows = np.repeat(np.arange(N, dtype=upper.indices.dtype),
+                     np.diff(upper.indptr))
+    edge_id = np.arange(n_edges, dtype=upper.indices.dtype)
+
+    adj = csr_array(
+        (np.concatenate((edge_id, edge_id)),
+         (np.concatenate((rows, upper.indices)),
+          np.concatenate((upper.indices, rows)))),
+        shape=(N, N))
+
+    bridge_id = _bridges_undirected(
+        adj.indices, adj.indptr,
+        adj.data.astype(upper.indices.dtype, copy=False))
+
+    # Edge ids were assigned in lexicographic order.
+    bridge_id.sort()
+    result = np.empty((bridge_id.shape[0], 2), dtype=upper.indices.dtype)
+    result[:, 0] = rows[bridge_id]
+    result[:, 1] = upper.indices[bridge_id]
+    return result
+
+
+def _bridges_undirected(
+        np.ndarray[int32_or_int64, ndim=1, mode='c'] indices,
+        np.ndarray[int32_or_int64, ndim=1, mode='c'] indptr,
+        np.ndarray[int32_or_int64_b, ndim=1, mode='c'] edge_ids):
+    return _bridges_undirected2(indices, indptr, edge_ids)
+
+
+@cython.boundscheck(False)
+@cython.wraparound(False)
+cdef _bridges_undirected2(
+        np.ndarray[int32_or_int64, ndim=1, mode='c'] indices,
+        np.ndarray[int32_or_int64, ndim=1, mode='c'] indptr,
+        np.ndarray[int32_or_int64_b, ndim=1, mode='c'] edge_ids):
+    """Iterative Tarjan bridge search on a symmetric CSR multigraph.
+
+    The adjacency lists are given by ``indices``/``indptr``; the value
+    stored for each directed adjacency slot in ``edge_ids`` identifies
+    the undirected edge.  Each undirected edge occupies one slot in each
+    direction and the two slots share the same edge id, which lets the
+    reverse direction of a DFS-tree edge be skipped while genuine
+    parallel edges are still distinguished.
+
+    Returns the ids of the bridge edges.  Complexity is O(V + E) in
+    both time and extra storage.
+    """
+    cdef:
+        int N = <int>(indptr.shape[0]) - 1
+        int root, v, w, p, timer
+        Py_ssize_t pos, k, n_bridge
+        vector[int] dfs_stack
+        vector[int32_or_int64] cursor
+        vector[int32_or_int64_b] parent_edge
+        vector[int32_or_int64_b] bridge_edges
+        np.ndarray[ITYPE_t, ndim=1, mode='c'] disc
+        np.ndarray[ITYPE_t, ndim=1, mode='c'] low
+        np.ndarray[int32_or_int64_b, ndim=1, mode='c'] result
+
+    disc = np.empty(N, dtype=ITYPE)
+    low = np.empty(N, dtype=ITYPE)
+    disc.fill(-1)
+    low.fill(-1)
+    cursor.assign(N, 0)
+    parent_edge.assign(N, -1)
+    dfs_stack.reserve(N)
+
+    timer = 0
+    for root in range(N):
+        if disc[root] != -1:
+            continue
+
+        # ---- Start a depth-first search rooted at root ----
+        disc[root] = timer
+        low[root] = timer
+        timer += 1
+        cursor[root] = indptr[root]
+        dfs_stack.push_back(root)
+
+        while dfs_stack.size() > 0:
+            v = dfs_stack.back()
+            if cursor[v] < indptr[v + 1]:
+                # ---- Examine the next adjacency slot of v ----
+                pos = cursor[v]
+                cursor[v] += 1
+                w = indices[pos]
+
+                if edge_ids[pos] == parent_edge[v]:
+                    # reverse direction of the DFS-tree edge
+                    continue
+                if disc[w] == -1:
+                    # tree edge v -> w
+                    parent_edge[w] = edge_ids[pos]
+                    disc[w] = timer
+                    low[w] = timer
+                    timer += 1
+                    cursor[w] = indptr[w]
+                    dfs_stack.push_back(w)
+                elif disc[w] < low[v]:
+                    # back edge from v to an ancestor w
+                    low[v] = disc[w]
+            else:
+                # ---- All neighbors of v processed: postvisit v ----
+                dfs_stack.pop_back()
+                if dfs_stack.size() > 0:
+                    p = dfs_stack.back()
+                    if low[v] < low[p]:
+                        low[p] = low[v]
+                    if low[v] > disc[p]:
+                        bridge_edges.push_back(parent_edge[v])
+
+    n_bridge = bridge_edges.size()
+    result = np.empty(n_bridge, dtype=edge_ids.dtype)
+    for k in range(n_bridge):
+        result[k] = bridge_edges[k]
+    return result

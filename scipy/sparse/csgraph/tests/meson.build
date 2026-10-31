@@ -1,5 +1,6 @@
 python_sources = [
   '__init__.py',
+  'test_bridges.py',
   'test_connected_components.py',
   'test_conversions.py',
   'test_flow.py',

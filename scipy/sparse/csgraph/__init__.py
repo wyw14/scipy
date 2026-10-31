@@ -13,6 +13,7 @@ Contents
    :toctree: generated/
 
    connected_components -- determine connected components of a graph
+   bridges -- find the bridges (cut edges) of an undirected graph
    laplacian -- compute the laplacian of a graph
    shortest_path -- compute the shortest path between points on a positive graph
    dijkstra -- use Dijkstra's algorithm for shortest path
@@ -158,6 +159,7 @@ with non-edges indicated by zeros, infinities, and NaN entries.
 __docformat__ = "restructuredtext en"
 
 __all__ = ['connected_components',
+           'bridges',
            'laplacian',
            'shortest_path',
            'floyd_warshall',
@@ -191,7 +193,7 @@ from ._shortest_path import (
 )
 from ._traversal import (
     breadth_first_order, depth_first_order, breadth_first_tree,
-    depth_first_tree, connected_components
+    depth_first_tree, connected_components, bridges
 )
 from ._min_spanning_tree import minimum_spanning_tree
 from ._flow import maximum_flow

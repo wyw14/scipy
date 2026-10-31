@@ -56,6 +56,9 @@ New features
 ``scipy.sparse`` improvements
 =============================
 
+- ``scipy.sparse.csgraph`` now provides ``bridges``, which finds the
+  bridges (cut edges) of an undirected graph in linear time with an
+  iterative depth-first search.
 
 
 ``scipy.spatial`` improvements
