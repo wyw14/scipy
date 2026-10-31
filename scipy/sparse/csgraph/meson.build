@@ -48,6 +48,7 @@ endforeach
 
 python_sources = [
   '__init__.py',
+  '_condensation.py',
   '_laplacian.py',
   '_validation.py',
 ]
