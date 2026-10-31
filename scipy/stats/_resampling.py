@@ -1511,6 +1511,139 @@ def _calculate_null_both(data, statistic, n_permutations, batch,
     return null_distribution, n_permutations, exact_test
 
 
+def _stratified_permutation(strata_groups, n_obs, rng):
+    """
+    Generate one random permutation of the pooled observations that leaves
+    each observation within its stratum.
+
+    `strata_groups` is a sequence of 1D arrays; `strata_groups[s]` holds the
+    pooled indices of the observations in stratum `s`, ordered by sample.
+    Within each stratum, indices are randomly permuted in place, so the
+    number of observations assigned to each sample within each stratum is
+    preserved and observations are never exchanged between strata.
+    """
+    indices = np.arange(n_obs)
+    for group in strata_groups:
+        indices[group] = rng.permutation(group)
+    return indices
+
+
+def _all_stratified_partitions(strata_groups, strata_counts):
+    """
+    Generate every distinct way of assigning pooled observations to samples,
+    subject to stratification.
+
+    `strata_groups[s]` holds the pooled indices of the observations in
+    stratum `s`, ordered by sample (all observations of the first sample
+    first, then the second sample, and so on). `strata_counts[s][i]` is the
+    number of observations of sample `i` within stratum `s`.
+
+    Within each stratum, all partitions of the observations into samples of
+    the given sizes are enumerated; the Cartesian product across strata is
+    yielded. The order of observations *within* each sample is preserved
+    (the slot originally occupied by an observation of sample `i` is filled
+    with another observation assigned to sample `i`), so the first
+    permutation yielded is the observed assignment.
+    """
+    n_obs = sum(group.size for group in strata_groups)
+
+    # All within-stratum partitions, expressed in local (within-stratum)
+    # indices and concatenated across samples. Sizes are small whenever an
+    # exact test is feasible, so materializing these is acceptable.
+    per_stratum_partitions = []
+    per_stratum_bounds = []
+    for counts in strata_counts:
+        partitions = np.asarray(list(_all_partitions_concatenated(counts)))
+        per_stratum_partitions.append(partitions)
+        per_stratum_bounds.append(list(accumulate(counts, initial=0)))
+
+    for choices in product(*per_stratum_partitions):
+        indices = np.empty(n_obs, dtype=np.intp)
+        for group, bounds, partition in zip(strata_groups,
+                                           per_stratum_bounds, choices):
+            for i, j in zip(bounds[:-1], bounds[1:]):
+                # Slots of sample `i` within this stratum are filled with the
+                # observations assigned to sample `i` within this stratum.
+                indices[group[i:j]] = group[partition[i:j]]
+        yield indices
+
+
+def _calculate_null_stratified(data, statistic, n_permutations, batch,
+                               rng=None, *, xp, strata):
+    """
+    Calculate null distribution for stratified independent sample tests.
+
+    Observations are only exchanged between samples within the same stratum;
+    the number of observations assigned to each sample is fixed within each
+    stratum. The number of distinct assignments is the product of the
+    numbers of within-stratum partitions.
+    """
+    n_obs_i = [sample.shape[-1] for sample in data]  # observations per sample
+    n_obs_ic = list(accumulate(n_obs_i, initial=0))
+    n_obs = n_obs_ic[-1]  # total number of observations
+    n_samples = len(data)
+
+    # Encode the stratum labels of the pooled observations using a common
+    # mapping, so identical labels in different samples refer to the same
+    # stratum. Enumeration is over observation indices, so identical data
+    # values do not collapse the number of permutations.
+    pooled_labels = np.concatenate(strata, axis=0)
+    _, labels = np.unique(pooled_labels, return_inverse=True)
+    labels = np.asarray(labels, dtype=np.intp)
+    n_strata = int(labels.max()) + 1
+
+    # Pooled indices in each stratum (ordered by sample because the pooled
+    # data is itself ordered by sample), and the count of observations of
+    # each sample within each stratum.
+    strata_groups = []
+    strata_counts = np.empty((n_strata, n_samples), dtype=np.intp)
+    for s in range(n_strata):
+        strata_groups.append(np.flatnonzero(labels == s))
+        for i in range(n_samples):
+            block = labels[n_obs_ic[i]:n_obs_ic[i + 1]]
+            strata_counts[s, i] = np.count_nonzero(block == s)
+
+    # Number of distinct assignments: product over strata of the number of
+    # ways to partition the stratum into samples of the observed sizes.
+    n_max = 1
+    for counts in strata_counts:
+        bounds = list(accumulate(counts, initial=0))
+        n_max *= math.prod(math.comb(bounds[j + 1], bounds[j])
+                           for j in range(n_samples))
+
+    if n_permutations >= n_max:
+        exact_test = True
+        n_permutations = n_max
+        perm_generator = _all_stratified_partitions(strata_groups,
+                                                    strata_counts)
+    else:
+        exact_test = False
+        perm_generator = (_stratified_permutation(strata_groups, n_obs, rng)
+                          for i in range(n_permutations))
+
+    batch = batch or int(n_permutations)
+    null_distribution = []
+
+    # As in `_calculate_null_both`, concatenate the samples, index them with
+    # the generated permutations, split into new samples of the original
+    # sizes, and evaluate the statistic in batches.
+    data = xp.concat(data, axis=-1)
+    for indices in _batch_generator(perm_generator, batch=batch):
+        # Creating a tensor from a list of numpy.ndarrays is extremely slow...
+        indices = np.asarray(indices)
+        indices = xp.asarray(indices, device=xp_device(data))
+
+        # `indices` is 2D: each row is a permutation of the indices.
+        data_batch = _get_from_last_axis(data, indices, xp=xp)
+        data_batch = xp.moveaxis(data_batch, -2, 0)
+        data_batch = [data_batch[..., i:j]
+                      for i, j in zip(n_obs_ic[:-1], n_obs_ic[1:])]
+        null_distribution.append(statistic(*data_batch, axis=-1))
+    null_distribution = xp.concat(null_distribution, axis=0)
+
+    return null_distribution, n_permutations, exact_test
+
+
 def _calculate_null_pairings(data, statistic, n_permutations, batch,
                              rng=None, *, xp):
     """
@@ -1607,7 +1740,7 @@ def _calculate_null_samples(data, statistic, n_permutations, batch,
 
 
 def _permutation_test_iv(data, statistic, permutation_type, vectorized,
-                         n_resamples, batch, alternative, axis, rng):
+                         n_resamples, batch, alternative, axis, strata, rng):
     """Input validation for `permutation_test`."""
     axis_int = int(axis)
     if axis != axis_int:
@@ -1617,6 +1750,11 @@ def _permutation_test_iv(data, statistic, permutation_type, vectorized,
     permutation_type = permutation_type.lower()
     if permutation_type not in permutation_types:
         raise ValueError(f"`permutation_type` must be in {permutation_types}.")
+
+    if strata is not None and permutation_type != 'independent':
+        message = ("`strata` is only compatible with "
+                   "`permutation_type='independent'`.")
+        raise ValueError(message)
 
     if vectorized not in {True, False, None}:
         raise ValueError("`vectorized` must be `True`, `False`, or `None`.")
@@ -1651,6 +1789,38 @@ def _permutation_test_iv(data, statistic, permutation_type, vectorized,
         sample = xp.moveaxis(sample, axis_int, -1)
         data_iv.append(sample)
 
+    strata_iv = None
+    if strata is not None:
+        message = ("`strata` must be a sequence of label arrays, one for "
+                   "each sample in `data`.")
+        try:
+            n_strata_samples = len(strata)
+        except TypeError as e:
+            raise TypeError(message) from e
+        if n_strata_samples != len(data_iv):
+            raise ValueError(message)
+
+        strata_iv = []
+        for labels, sample in zip(strata, data_iv):
+            labels = np.asarray(labels)
+            if labels.ndim != 1:
+                message = ("each element of `strata` must be a 1D array of "
+                           "labels with one label per observation along "
+                           "`axis`.")
+                raise ValueError(message)
+            if labels.shape[0] != sample.shape[-1]:
+                message = ("each element of `strata` must have the same "
+                           "length as the corresponding sample along `axis`.")
+                raise ValueError(message)
+            if labels.dtype.kind in 'fc' and np.isnan(labels).any():
+                message = "`strata` labels must not contain NaN."
+                raise ValueError(message)
+            if (labels.dtype.kind == 'O'
+                    and any(label is None for label in labels.tolist())):
+                message = "`strata` labels must not be missing."
+                raise ValueError(message)
+            strata_iv.append(labels)
+
     n_resamples_int = (int(n_resamples) if not math.isinf(n_resamples)
                        else xp.inf)
     if n_resamples != n_resamples_int or n_resamples_int <= 0:
@@ -1673,14 +1843,15 @@ def _permutation_test_iv(data, statistic, permutation_type, vectorized,
     float_dtype = xp_result_type(*data_iv, force_floating=True, xp=xp)
 
     return (data_iv, statistic, permutation_type, vectorized, n_resamples_int,
-            batch_iv, alternative, axis_int, rng, float_dtype, xp)
+            batch_iv, alternative, axis_int, strata_iv, rng, float_dtype, xp)
 
 
 @xp_capabilities(skip_backends=[('dask.array', "lacks required indexing capabilities")])
 @_transition_to_rng('random_state')
 def permutation_test(data, statistic, *, permutation_type='independent',
                      vectorized=None, n_resamples=9999, batch=None,
-                     alternative="two-sided", axis=0, rng=None):
+                     alternative="two-sided", axis=0, strata=None,
+                     rng=None):
     r"""
     Performs a permutation test of a given statistic on provided data.
 
@@ -1779,6 +1950,18 @@ def permutation_test(data, statistic, *, permutation_type='independent',
         statistic. If samples have a different number of dimensions,
         singleton dimensions are prepended to samples with fewer dimensions
         before `axis` is considered.
+    strata : sequence of array-like, optional
+        Stratum labels for a stratified (restricted-randomization)
+        permutation test. Only compatible with
+        ``permutation_type='independent'``. The sequence must contain one
+        1D array of labels for each sample in `data`, and the length of this
+        array must equal the length of the corresponding sample along `axis`;
+        labels must not contain NaN.
+        Observations are exchanged between samples only when they share the
+        same label, so observations are never moved between strata, and the
+        number of observations assigned to each sample within each stratum
+        is held fixed. Identical labels in different samples are treated as
+        the same stratum.
     rng : `numpy.random.Generator`, optional
         Pseudorandom number generator state. When `rng` is None, a new
         `numpy.random.Generator` is created using entropy from the
@@ -1846,6 +2029,29 @@ def permutation_test(data, statistic, *, permutation_type='independent',
     sample, the number of distinct partitions is::
 
         np.prod([binom(sum(n[i:]), sum(n[i+1:])) for i in range(len(n)-1)])
+
+    **Stratified independent-sample statistics** (`strata` provided):
+
+    When observations are grouped into experimental strata (blocks) and the
+    random assignment of observations to samples was performed *within* each
+    stratum, the permutations must respect this design: an observation may
+    only be exchanged with another observation carrying the same stratum
+    label. The number of observations assigned to each sample is held fixed
+    within each stratum, and observations are never exchanged between strata.
+    If ``n`` is an array listing the number of observations of each sample
+    within a stratum, the number of distinct partitions of that stratum is::
+
+        np.prod([binom(sum(n[i:]), sum(n[i+1:])) for i in range(len(n)-1)])
+
+    and the total number of distinct stratified permutations is the product
+    of these quantities over strata. As above, the count is based on the
+    observation *indices*, so identical data values do not reduce the number
+    of permutations. When ``n_resamples`` is at least this number, an exact
+    stratified test is performed by enumerating every within-stratum
+    partition; otherwise independent random permutations are drawn within
+    each stratum. If no stratum contains observations of more than one
+    sample, there are no exchangeable observations: the null distribution
+    contains only the observed statistic and the p-value is ``1.0``.
 
     **Paired statistics, permute pairings** (``permutation_type='pairings'``):
 
@@ -2101,20 +2307,26 @@ def permutation_test(data, statistic, *, permutation_type='independent',
     """
     args = _permutation_test_iv(data, statistic, permutation_type, vectorized,
                                 n_resamples, batch, alternative, axis,
-                                rng)
+                                strata, rng)
     (data, statistic, permutation_type, vectorized, n_resamples, batch,
-     alternative, axis, rng, float_dtype, xp) = args
+     alternative, axis, strata, rng, float_dtype, xp) = args
 
     observed = statistic(*data, axis=-1)
 
     null_calculators = {"pairings": _calculate_null_pairings,
                         "samples": _calculate_null_samples,
                         "independent": _calculate_null_both}
-    null_calculator_args = (data, statistic, n_resamples,
-                            batch, rng)
-    calculate_null = null_calculators[permutation_type]
+    if strata is not None:
+        # Restricted randomization: exchange observations between samples
+        # only within the provided strata.
+        calculate_null = _calculate_null_stratified
+        null_kwargs = {'strata': strata}
+    else:
+        calculate_null = null_calculators[permutation_type]
+        null_kwargs = {}
+    null_calculator_args = (data, statistic, n_resamples, batch, rng)
     null_distribution, n_resamples, exact_test = (
-        calculate_null(*null_calculator_args, xp=xp))
+        calculate_null(*null_calculator_args, xp=xp, **null_kwargs))
 
     # See References [2] and [3]
     adjustment = 0 if exact_test else 1

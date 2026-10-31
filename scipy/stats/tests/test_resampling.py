@@ -1,4 +1,6 @@
+import math
 import warnings
+from itertools import combinations, product
 
 import pytest
 
@@ -2018,6 +2020,379 @@ class TestPermutationTest:
         xp_assert_equal(res.pvalue[0], ref.pvalue)
         xp_assert_equal(res.statistic[1], NaN)
         xp_assert_equal(res.pvalue[1], NaN)
+
+    # -- Stratified independent-sample permutation tests -- #
+    @pytest.mark.parametrize('permutation_type', ['samples', 'pairings'])
+    def test_strata_iv_incompatible_type(self, xp, permutation_type):
+        x = xp.asarray([1., 2., 3., 4.])
+        y = xp.asarray([2., 3., 4., 5.])
+        strata = ([0, 0, 1, 1], [0, 0, 1, 1])
+
+        def statistic(x, y, axis):
+            return xp.mean(x, axis=axis)
+
+        message = "`strata` is only compatible with..."
+        with pytest.raises(ValueError, match=message):
+            permutation_test((x, y), statistic,
+                             permutation_type=permutation_type, strata=strata)
+
+    def test_strata_iv(self, xp):
+        x = xp.asarray([1., 2., 3., 4.])
+        y = xp.asarray([2., 3., 4., 5.])
+
+        def statistic(x, y, axis):
+            return xp.mean(x, axis=axis) - xp.mean(y, axis=axis)
+
+        # `strata` is not a sequence of label arrays
+        message = "`strata` must be a sequence..."
+        with pytest.raises(TypeError, match=message):
+            permutation_test((x, y), statistic, strata=1)
+
+        # wrong number of label arrays
+        with pytest.raises(ValueError, match=message):
+            permutation_test((x, y), statistic, strata=([0, 0, 1, 1],))
+        with pytest.raises(ValueError, match=message):
+            permutation_test((x, y), statistic,
+                             strata=([0, 0, 1, 1], [0, 0, 1, 1], [0, 0, 1, 1]))
+
+        # label length does not match the sample along `axis`
+        message = "each element of `strata` must have the same length..."
+        with pytest.raises(ValueError, match=message):
+            permutation_test((x, y), statistic,
+                             strata=([0, 0, 1], [0, 0, 1, 1]))
+        with pytest.raises(ValueError, match=message):
+            permutation_test((x, y), statistic,
+                             strata=([0, 0, 1, 1], [0, 0, 0, 1, 1]))
+
+        # labels must be 1D
+        message = "each element of `strata` must be a 1D array..."
+        with pytest.raises(ValueError, match=message):
+            permutation_test((x, y), statistic,
+                             strata=(np.zeros((2, 2)), np.array([0, 0, 1, 1])))
+
+        # labels must not be missing (NaN)
+        message = "`strata` labels must not contain NaN."
+        with pytest.raises(ValueError, match=message):
+            permutation_test((x, y), statistic,
+                             strata=([0, 0, np.nan, 1], [0, 0, 1, 1]))
+
+    def test_stratified_partitions_generators(self):
+        # Check properties of the exact and random stratified generators
+        # directly: every yielded index array is a valid permutation that
+        # keeps every observation in its original stratum and preserves the
+        # number of observations of each sample within each stratum.
+        rng = np.random.default_rng(4264)
+        nx, ny = 5, 6
+        sx = np.array(['a', 'a', 'b', 'b', 'c'])
+        sy = np.array(['a', 'b', 'b', 'c', 'c', 'c'])
+        labels = np.concatenate([sx, sy])
+        _, encoded = np.unique(labels, return_inverse=True)
+        n_strata = int(encoded.max()) + 1
+
+        groups, counts = [], []
+        n_max = 1
+        for s in range(n_strata):
+            group = np.flatnonzero(encoded == s)
+            groups.append(group)
+            ns = [int(np.count_nonzero(encoded[:nx] == s)),
+                  int(np.count_nonzero(encoded[nx:] == s))]
+            counts.append(ns)
+            bounds = [0, ns[0], ns[0] + ns[1]]
+            n_max *= math.prod(math.comb(bounds[j + 1], bounds[j])
+                               for j in range(len(ns)))
+
+        # exact enumeration
+        permutations = list(
+            _resampling._all_stratified_partitions(groups, counts))
+        assert len(permutations) == n_max
+        # the observed assignment is enumerated first
+        assert_equal(permutations[0], np.arange(nx + ny))
+        # all assignments are distinct
+        unique = {tuple(permutation) for permutation in permutations}
+        assert len(unique) == n_max
+        for permutation in permutations:
+            # a valid permutation ...
+            assert_equal(np.sort(permutation), np.arange(nx + ny))
+            # ... that leaves each observation in its original stratum
+            assert_equal(encoded[permutation], encoded)
+            # ... preserving per-sample within-stratum counts
+            assert_equal(np.sort(encoded[permutation[:nx]]),
+                         np.sort(encoded[:nx]))
+            assert_equal(np.sort(encoded[permutation[nx:]]),
+                         np.sort(encoded[nx:]))
+
+        # random draws have the same properties
+        for i in range(500):
+            permutation = _resampling._stratified_permutation(
+                groups, nx + ny, rng)
+            assert_equal(np.sort(permutation), np.arange(nx + ny))
+            assert_equal(encoded[permutation], encoded)
+            assert_equal(np.sort(encoded[permutation[:nx]]),
+                         np.sort(encoded[:nx]))
+            assert_equal(np.sort(encoded[permutation[nx:]]),
+                         np.sort(encoded[nx:]))
+
+        # fixed seed reproduces the same sequence of permutations
+        rng1 = np.random.default_rng(123)
+        rng2 = np.random.default_rng(123)
+        p1 = [_resampling._stratified_permutation(groups, nx + ny, rng1)
+              for i in range(10)]
+        p2 = [_resampling._stratified_permutation(groups, nx + ny, rng2)
+              for i in range(10)]
+        assert_equal(p1, p2)
+
+    def test_stratified_no_cross_stratum_exchange(self):
+        # End-to-end check through `_calculate_null_stratified`, both exact
+        # and randomized: after permutation, the observation found in each
+        # pooled slot must carry the same stratum label as the observation
+        # originally in that slot.
+        nx, ny = 4, 5
+        sx = np.array([0, 0, 1, 1])
+        sy = np.array([0, 1, 1, 1, 2])  # stratum 2 occurs only in `y`
+        labels = np.concatenate([sx, sy])
+        data = [np.arange(nx, dtype=float),
+                np.arange(nx, nx + ny, dtype=float)]
+
+        def concat_statistic(x, y, axis):
+            # array-valued statistic: each row is the permuted pooled data
+            return np.concatenate([x, y], axis=axis)
+
+        xp = array_namespace(*data)
+        null, n_permutations, exact = _resampling._calculate_null_stratified(
+            data, concat_statistic, np.inf, None, xp=xp, strata=[sx, sy])
+        assert exact
+        # comb(3, 2) * comb(5, 2) * 1 = 30
+        assert n_permutations == 30
+        for row in null:
+            assert_equal(labels[row.astype(int)], labels)
+
+        rng = np.random.default_rng(0)
+        null, n_permutations, exact = _resampling._calculate_null_stratified(
+            data, concat_statistic, 20, None, rng=rng, xp=xp,
+            strata=[sx, sy])
+        assert not exact
+        assert n_permutations == 20
+        for row in null:
+            assert_equal(labels[row.astype(int)], labels)
+
+    def test_stratified_exact_against_manual(self):
+        # Compare the exact stratified null distribution and p-values with
+        # a manual enumeration of every within-stratum assignment.
+        x = np.array([1., 2., 3., 4.])
+        y = np.array([5., 6., 7.])
+        sx = np.array(['a', 'a', 'b', 'b'])
+        sy = np.array(['a', 'b', 'b'])
+
+        def statistic(x, y, axis):
+            return np.mean(x, axis=axis) - np.mean(y, axis=axis)
+
+        res = permutation_test((x, y), statistic, strata=(sx, sy),
+                               n_resamples=np.inf, vectorized=True)
+        # comb(3, 2) * comb(4, 2) = 18
+        assert res.null_distribution.shape == (18,)
+        # the observed assignment is included (first in the enumeration)
+        assert_allclose(res.null_distribution[0], res.statistic)
+
+        # manual enumeration of the within-stratum assignments
+        pooled = np.concatenate([x, y])
+        labels = np.concatenate([sx, sy])
+        nx = x.size
+        stratum_groups = [np.flatnonzero(labels == s) for s in ['a', 'b']]
+        choices = []
+        for group in stratum_groups:
+            n0 = int(np.count_nonzero(labels[:nx] == labels[group[0]]))
+            choices.append(list(combinations(range(group.size), n0)))
+
+        expected = []
+        for chosen in product(*choices):
+            permutation = np.empty(pooled.size, dtype=int)
+            for group, c in zip(stratum_groups, chosen):
+                c = np.array(c)
+                rest = np.array(sorted(set(range(group.size)) - set(c)))
+                n0 = c.size  # slots of `x` within the stratum come first
+                permutation[group[:n0]] = group[c]
+                permutation[group[n0:]] = group[rest]
+            expected.append(statistic(pooled[permutation[:nx]],
+                                      pooled[permutation[nx:]], axis=0))
+        expected = np.sort(expected)
+        assert_allclose(np.sort(res.null_distribution), expected, atol=1e-14)
+
+        for alternative, operator in (('less', np.less_equal),
+                                      ('greater', np.greater_equal)):
+            r = permutation_test((x, y), statistic, strata=(sx, sy),
+                                 n_resamples=np.inf, alternative=alternative)
+            count = np.count_nonzero(operator(expected, r.statistic))
+            assert_allclose(r.pvalue, count / expected.size, atol=1e-14)
+
+    @pytest.mark.parametrize('alternative', ['less', 'greater', 'two-sided'])
+    def test_stratified_no_exchangeable_observations(self, alternative):
+        # strata do not overlap between samples: the null distribution
+        # contains only the observed statistic and the p-value is 1
+        x = np.array([1., 2., 3.])
+        y = np.array([4., 5., 6.])
+        strata = ([0, 0, 0], [1, 1, 1])
+
+        def statistic(x, y, axis):
+            return np.mean(x, axis=axis) - np.mean(y, axis=axis)
+
+        res = permutation_test((x, y), statistic, strata=strata,
+                               alternative=alternative,
+                               n_resamples=np.inf)
+        assert res.null_distribution.size == 1
+        assert_allclose(res.null_distribution[0], res.statistic)
+        assert res.pvalue == 1.0
+
+    def test_stratified_partial_degenerate_size(self):
+        # one exchangeable stratum and two strata present in only one sample
+        x = np.array([1., 2., 3.])
+        y = np.array([4., 5., 6.])
+        # stratum 0: two observations of each sample -> comb(4, 2) = 6
+        # stratum 1: only `x`, stratum 2: only `y` -> factor 1 each
+        strata = ([0, 0, 1], [0, 0, 2])
+
+        def statistic(x, y, axis):
+            return np.mean(x, axis=axis) - np.mean(y, axis=axis)
+
+        res = permutation_test((x, y), statistic, strata=strata,
+                               n_resamples=np.inf)
+        assert res.null_distribution.size == 6
+
+    def test_stratified_ties_not_collapsed(self):
+        # identical data values must not reduce the number of permutations;
+        # the count is based on observation indices
+        x = np.array([1., 1., 2., 2.])
+        y = np.array([1., 2., 2.])
+        strata = (['a', 'a', 'b', 'b'], ['a', 'b', 'b'])
+
+        def statistic(x, y, axis):
+            return np.mean(x, axis=axis) - np.mean(y, axis=axis)
+
+        res = permutation_test((x, y), statistic, strata=strata,
+                               n_resamples=np.inf)
+        assert res.null_distribution.size == 18
+
+    def test_stratified_three_samples_size(self):
+        x = np.array([1., 2., 3.])
+        y = np.array([4., 5.])
+        z = np.array([6., 7.])
+        sx = ['a', 'a', 'b']
+        sy = ['a', 'b']
+        sz = ['a', 'b']
+
+        def statistic(x, y, z, axis):
+            return (np.mean(x, axis=axis) + np.mean(y, axis=axis)
+                    - 2 * np.mean(z, axis=axis))
+
+        # stratum 'a' counts (2, 1, 1): comb(4, 2) * comb(2, 1) = 12
+        # stratum 'b' counts (1, 1, 1): comb(3, 1) * comb(2, 1) = 6
+        # total: 72
+        res = permutation_test((x, y, z), statistic,
+                               strata=(sx, sy, sz), n_resamples=np.inf)
+        assert res.null_distribution.size == 72
+
+    @pytest.mark.parametrize('n_resamples,expected',
+                             [(np.inf, 18), (5, 5), (9999, 18)])
+    def test_stratified_null_distribution_size(self, n_resamples, expected):
+        x = np.array([1., 2., 3., 4.])
+        y = np.array([5., 6., 7.])
+        strata = (['a', 'a', 'b', 'b'], ['a', 'b', 'b'])
+
+        def statistic(x, y, axis):
+            return np.mean(x, axis=axis) - np.mean(y, axis=axis)
+
+        res = permutation_test((x, y), statistic, strata=strata,
+                               n_resamples=n_resamples,
+                               rng=np.random.default_rng(0))
+        assert res.null_distribution.size == expected
+
+    def test_stratified_batch_independence(self):
+        # the exact p-value and the randomized null distribution must not
+        # depend on the `batch` size
+        rng_data = np.random.default_rng(99)
+        x = rng_data.normal(size=6)
+        y = rng_data.normal(size=7)
+        sx = np.array([0, 0, 0, 1, 1, 1])
+        sy = np.array([0, 0, 1, 1, 1, 1, 0])
+
+        def statistic(x, y, axis):
+            return np.mean(x, axis=axis) - np.mean(y, axis=axis)
+
+        exact = [permutation_test((x, y), statistic, strata=(sx, sy),
+                                  n_resamples=np.inf, batch=batch)
+                 for batch in (None, 1, 3, 100)]
+        for res in exact[1:]:
+            assert_allclose(res.pvalue, exact[0].pvalue)
+            assert_allclose(np.sort(res.null_distribution),
+                            np.sort(exact[0].null_distribution))
+
+        randomized = [permutation_test((x, y), statistic, strata=(sx, sy),
+                                       n_resamples=50, batch=batch,
+                                       rng=np.random.default_rng(42))
+                      for batch in (None, 1, 7, 50)]
+        for res in randomized[1:]:
+            assert_allclose(res.pvalue, randomized[0].pvalue)
+            # one RNG draw per stratum per resample, so batches are identical
+            assert_allclose(res.null_distribution,
+                            randomized[0].null_distribution)
+
+    def test_stratified_rng_reproducible(self):
+        x = np.array([1., 2., 3., 4., 5., 6.])
+        y = np.array([2., 3., 4., 5., 6., 7., 8.])
+        sx = np.array([0, 0, 0, 1, 1, 1])
+        sy = np.array([0, 0, 1, 1, 1, 1, 0])
+
+        def statistic(x, y, axis):
+            return np.mean(x, axis=axis) - np.mean(y, axis=axis)
+
+        kwds = {'strata': (sx, sy), 'n_resamples': 100}
+        res1 = permutation_test((x, y), statistic,
+                                rng=np.random.default_rng(2024), **kwds)
+        res2 = permutation_test((x, y), statistic,
+                                rng=np.random.default_rng(2024), **kwds)
+        assert_allclose(res1.null_distribution, res2.null_distribution)
+        assert_allclose(res1.pvalue, res2.pvalue)
+        assert_allclose(res1.statistic, res2.statistic)
+
+    def test_stratified_randomized_against_exact(self):
+        # stratum 0: 4 observations of each sample
+        # stratum 1: 5 observations of each sample
+        # n_max = comb(8, 4) * comb(10, 5) = 17640
+        rng = np.random.default_rng(8235259808)
+        x = rng.normal(size=9) + 0.3
+        y = rng.normal(size=9)
+        sx = np.array(['a'] * 4 + ['b'] * 5)
+        sy = np.array(['a'] * 4 + ['b'] * 5)
+
+        def statistic(x, y, axis):
+            return np.mean(x, axis=axis) - np.mean(y, axis=axis)
+
+        kwds = {'strata': (sx, sy), 'alternative': 'less'}
+        res = permutation_test((x, y), statistic, n_resamples=6000,
+                               rng=np.random.default_rng(0), **kwds)
+        ref = permutation_test((x, y), statistic, n_resamples=np.inf, **kwds)
+        assert_allclose(res.pvalue, ref.pvalue, atol=2e-2)
+
+    def test_stratified_axis(self):
+        # ND samples with `axis=-1`: each row should match the 1D result
+        rng = np.random.default_rng(7)
+        nx, ny, n_rows = 4, 5, 3
+        X = rng.normal(size=(n_rows, nx))
+        Y = rng.normal(size=(n_rows, ny))
+        sx = ['a', 'a', 'b', 'b']
+        sy = ['a', 'b', 'b', 'b', 'c']
+
+        def statistic(x, y, axis):
+            return np.mean(x, axis=axis) - np.mean(y, axis=axis)
+
+        res = permutation_test((X, Y), statistic, axis=-1,
+                               strata=(sx, sy), n_resamples=np.inf)
+        # comb(3, 2) * comb(5, 2) * 1 = 30 permutations, one column per row
+        assert res.null_distribution.shape == (30, n_rows)
+        for k in range(n_rows):
+            ref = permutation_test((X[k], Y[k]), statistic,
+                                   strata=(sx, sy), n_resamples=np.inf)
+            assert_allclose(res.statistic[k], ref.statistic)
+            assert_allclose(res.pvalue[k], ref.pvalue)
 
 
 def test_all_partitions_concatenated():
